@@ -199,7 +199,7 @@ def create_trend_sparkline(data: list, title: str, color: str = "#1f77b4") -> go
         line=dict(color=color, width=2),
         marker=dict(size=4),
         fill='tozeroy',
-        fillcolor=color.replace(')', ', 0.1)').replace('rgb', 'rgba') if 'rgb' in color else f"rgba{color[4:-1]}, 0.1)"
+        fillcolor=color.replace(')', ', 0.1)').replace('rgb', 'rgba') if 'rgb' in color else "rgba(" + ",".join(str(int(color[i:i+2], 16)) for i in (1, 3, 5)) + ",0.1)"
     ))
     
     fig.update_layout(
@@ -228,32 +228,52 @@ def main():
         
         # Credentials input
         st.subheader("Garmin Connect Login")
-        username = st.text_input(
-            "Email/Username",
-            value=os.getenv("GARMIN_USERNAME", ""),
-            placeholder="your.email@example.com"
+        configured = bool(os.getenv("GARMIN_USERNAME") and os.getenv("GARMIN_PASSWORD"))
+        use_configured = st.checkbox("Use securely configured credentials", value=configured,
+                                     disabled=not configured)
+        entered_username = st.text_input(
+            "Email/Username", placeholder="your.email@example.com", disabled=use_configured
         )
-        password = st.text_input(
-            "Password",
-            type="password",
-            value=os.getenv("GARMIN_PASSWORD", ""),
-            help="App will store tokens locally to avoid frequent MFA prompts"
+        entered_password = st.text_input(
+            "Password", type="password", disabled=use_configured,
+            help="Credentials and sessions are kept out of repository files."
         )
-        
-        # Connect button
+        # Injected secrets never become widget defaults or browser state.
+        username = os.getenv("GARMIN_USERNAME", "") if use_configured else entered_username
+        password = os.getenv("GARMIN_PASSWORD", "") if use_configured else entered_password
+
         if st.button("🔗 Connect to Garmin", type="primary"):
             if username and password:
                 with st.spinner("Connecting to Garmin Connect..."):
                     try:
                         client = get_client(username, password)
-                        st.session_state.garmin_client = client
-                        st.success("✅ Connected successfully!")
-                    except Exception as e:
-                        st.error(f"❌ Connection failed: {str(e)}")
-                        st.session_state.error_message = str(e)
+                        st.session_state.error_message = None
+                        if client.needs_mfa:
+                            st.session_state.pending_garmin_client = client
+                            st.info("Enter the verification code Garmin sent you.")
+                        else:
+                            st.session_state.garmin_client = client
+                            st.success("✅ Connected successfully!")
+                    except ConnectionError as error:
+                        st.session_state.error_message = str(error)
+                    except Exception:
+                        st.session_state.error_message = "Garmin connection failed. Please try again later."
             else:
                 st.warning("Please enter both username and password")
-        
+
+        pending = st.session_state.get("pending_garmin_client")
+        if pending:
+            code = st.text_input("Garmin verification code", type="password", key="garmin_mfa_code")
+            if st.button("Verify Garmin login", disabled=not code):
+                if pending.complete_mfa(code):
+                    st.session_state.garmin_client = pending
+                    st.session_state.pending_garmin_client = None
+                    st.session_state.error_message = None
+                    st.session_state.pop("garmin_mfa_code", None)
+                    st.rerun()
+                else:
+                    st.session_state.error_message = pending.error_message
+
         st.divider()
         
         # Data refresh controls
@@ -267,8 +287,7 @@ def main():
                         st.session_state.last_update = datetime.now()
                         st.success("✅ Data refreshed!")
                     except Exception as e:
-                        st.error(f"❌ Data fetch failed: {str(e)}")
-                        st.session_state.error_message = str(e)
+                        st.session_state.error_message = "Garmin data could not be fetched. Please try again later."
             
             # Show last update time
             if st.session_state.last_update:
@@ -286,7 +305,7 @@ def main():
                     st.session_state.last_update = None
                     st.success("Logged out successfully")
                 except Exception as e:
-                    st.error(f"Logout error: {e}")
+                    st.error("Could not clear the local session.")
     
     # Main content area
     if st.session_state.error_message:

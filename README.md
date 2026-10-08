@@ -18,10 +18,34 @@ A lightweight, local web application that pulls passive health and activity data
 
 ## Setup
 
+For the development workflow and definition of done, follow
+[the development-loop skill](.agents/skills/development-loop/SKILL.md).
+See [the current handoff](docs/handoff.md) for validation evidence and blockers.
+
+### Read-only account access
+
+This app authenticates with Garmin and reads health/activity data. Its account
+API transport rejects POST, PUT, PATCH, and DELETE requests. Sign-in, verification,
+and token refresh may still use POST. Disconnect clears only local session state.
+The password itself retains normal account privileges; see [AGENTS.md](AGENTS.md)
+for rules all agents must follow.
+
+For cloud use, inject `GARMIN_USERNAME` and `GARMIN_PASSWORD` through secure
+environment settings. Do not send values in chat or commit a `.env` file.
+The UI's **Use securely configured credentials** option keeps injected values
+out of browser widgets. Sessions and SQLite files use private temporary storage;
+the app does not persist reusable login tokens in the repository.
+
+The tested SDK is `garminconnect==0.3.17`: credentials belong in the `Garmin`
+constructor, not `login()`. MFA continues on the same in-memory session using
+the verification-code field. Garmin may block cloud sign-in with an HTTP 403
+security challenge. A successful local/mock test does not establish real-account
+connectivity. Keep TLS verification and the configured proxy enabled.
+
 ### Prerequisites
 
 ```bash
-pip install garminconnect streamlit plotly
+pip install -r requirements.txt
 ```
 
 ### Configuration
@@ -36,17 +60,18 @@ GARMIN_PASSWORD=your_password
 ### Running the App
 
 ```bash
-cd garmin-readiness-app
-streamlit run app.py --server.address=0.0.0.0
+cd garmin-companion-app
+streamlit run app.py --server.address=127.0.0.1 --browser.gatherUsageStats=false
 ```
 
-View the app on mobile devices connected to the same network by accessing the provided local IP address.
+The default listener is local to the machine. Keep it private when testing with
+real account credentials.
 
 ## Architecture
 
 ### 1. garmin_client.py
 
-Handles login, token saving, and data retrieval for:
+Handles in-memory login/MFA sessions and read-only data retrieval for:
 - Sleep metrics (duration, sleep score)
 - Autonomic recovery (HRV, RHR)
 - Daily load & stress (stress score, body battery)
@@ -71,21 +96,20 @@ Streamlit dashboard implementing:
 ## Data Flow
 
 1. User runs app
-2. App authenticates with Garmin Connect using stored tokens
+2. App authenticates with Garmin Connect and retains the session in memory
 3. Retrieves past 28 days of health and activity data
 4. Analytics engine processes data for readiness, trends, and gaps
 5. Streamlit UI renders results
 
 ## Storage
 
-Data is cached locally in SQLite to:
-- Prevent rate-limiting Garmin servers
-- Ensure offline access
-- Maintain user privacy
+The client initializes SQLite tables in private temporary storage, but persistent
+health-data caching and offline account-data access are not implemented. Login
+tokens are not saved to disk. Disconnect removes the client's temporary directory.
 
 ## Notes
 
-- Authentication tokens are stored locally in `~/.garminconnect` to avoid MFA prompts
+- Authentication sessions stay in memory; reconnecting may require MFA again
 - The app respects Garmin Connect's rate limits
 - All processing happens locally for privacy
 - The app is designed for desktop execution with mobile viewing via local network

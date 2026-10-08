@@ -1,91 +1,80 @@
 """
 Garmin Connect Client Module
 
-Handles authentication, token persistence, and data retrieval from Garmin Connect.
-Uses the garminconnect library with local token storage to avoid frequent MFA prompts.
+Handles read-only Garmin authentication and data retrieval.
+Sessions stay in memory; private temporary storage is cleared on disconnect.
 """
 
 import os
-import json
 import sqlite3
 import logging
+import tempfile
+import shutil
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 from pathlib import Path
+import requests
 
-import yaml
-from garminconnect import Garmin
+from garminconnect import (Garmin, GarminConnectAuthenticationError,
+                           GarminConnectConnectionError, GarminConnectTooManyRequestsError)
+from garminconnect.client import Client as SDKClient
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Constants
-TOKEN_DIR = Path.home() / ".garminconnect"
-TOKEN_FILE = TOKEN_DIR / "tokens.yaml"
-DB_PATH = Path.home() / ".garminconnect" / "cache.db"
+# Sessions and health caches are private and ephemeral by default.
+# Do not put account data or reusable tokens in repository files/snapshots.
+for sdk_logger in ("garminconnect", "garminconnect.client"):
+    logging.getLogger(sdk_logger).disabled = True
+
+
+class ReadOnlySDKClient(SDKClient):
+    """Reject account mutations before they reach Garmin.
+
+    Authentication/token refresh uses separate SDK auth transports. Account API
+    requests through this client are GET/HEAD only, including SDK convenience
+    methods that would otherwise upload, change, or delete data.
+    """
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # The managed HTTPS proxy supplies trust and credential injection.
+        # Use the SDK's requests strategies on this route rather than cycling
+        # browser TLS fingerprints, which can stall through multiple timeouts.
+        if os.getenv("HTTPS_PROXY"):
+            self.skip_strategies = {"mobile+cffi", "widget+cffi", "portal+cffi"}
+
+    def _http_post(self, url, **kwargs):
+        if os.getenv("HTTPS_PROXY"):
+            kwargs.setdefault("timeout", 30)
+            return requests.post(url, **kwargs)
+        return super()._http_post(url, **kwargs)
+
+    def _run_request(self, method, path, **kwargs):
+        if method.upper() not in {"GET", "HEAD"}:
+            raise PermissionError("Garmin account access is read-only")
+        return super()._run_request(method, path, **kwargs)
+
 
 # Activity type mappings
 TRAIL_RUN_TYPES = {"trail_run", "trail_running", "trailrun"}
 ROAD_RUN_TYPES = {"run", "running", "road_run", "roadrunning"}
 
 
-class TokenManager:
-    """Manages persistent token storage for Garmin Connect authentication."""
-    
-    def __init__(self, token_dir: Path = TOKEN_DIR):
-        self.token_dir = token_dir
-        self.token_file = token_dir / "tokens.yaml"
-        self._ensure_token_dir()
-    
-    def _ensure_token_dir(self):
-        """Create token directory if it doesn't exist."""
-        self.token_dir.mkdir(parents=True, exist_ok=True)
-    
-    def save_tokens(self, tokens: Dict[str, Any]):
-        """Save authentication tokens to local file."""
-        try:
-            with open(self.token_file, 'w') as f:
-                yaml.dump(tokens, f)
-            logger.info("Tokens saved successfully")
-        except Exception as e:
-            logger.error(f"Failed to save tokens: {e}")
-            raise
-    
-    def load_tokens(self) -> Optional[Dict[str, Any]]:
-        """Load authentication tokens from local file."""
-        try:
-            if self.token_file.exists():
-                with open(self.token_file, 'r') as f:
-                    tokens = yaml.safe_load(f)
-                    logger.info("Tokens loaded successfully")
-                    return tokens
-            return None
-        except Exception as e:
-            logger.error(f"Failed to load tokens: {e}")
-            return None
-    
-    def clear_tokens(self):
-        """Clear stored tokens."""
-        try:
-            if self.token_file.exists():
-                self.token_file.unlink()
-                logger.info("Tokens cleared")
-        except Exception as e:
-            logger.error(f"Failed to clear tokens: {e}")
-
-
 class GarminClient:
     """Main client for interacting with Garmin Connect API."""
     
     def __init__(self, username: str, password: str):
-        self.username = username
-        self.password = password
-        self.garmin = Garmin()
-        self.token_manager = TokenManager()
-        self.db_path = DB_PATH
+        self.garmin = Garmin(email=username, password=password,
+                             return_on_mfa=True, retry_attempts=0)
+        self.garmin.client = ReadOnlySDKClient(verify_login=True)
+        self.session_dir = Path(tempfile.mkdtemp(prefix="garmin-readiness-"))
+        self.db_path = self.session_dir / "cache.db"
+        self.needs_mfa = False
+        self.authenticated = False
+        self.error_message = None
         self._ensure_db()
-    
+
     def _ensure_db(self):
         """Initialize SQLite database for caching."""
         try:
@@ -111,50 +100,59 @@ class GarminClient:
             conn.commit()
             conn.close()
         except Exception as e:
-            logger.error(f"Database initialization error: {e}")
+            logger.error("Garmin operation failed (%s)", type(e).__name__)
     
+    def _finish_login(self):
+        # The SDK's return_on_mfa mode returns before profile initialization,
+        # even when MFA is unnecessary. Restore the in-memory session through
+        # its supported tokenstore API to initialize profile and units.
+        self.garmin.login(tokenstore=self.garmin.client.dumps())
+        self.garmin.password = None
+        self.authenticated = True
+        self.needs_mfa = False
+        self.error_message = None
+
+    def _login_error(self, error):
+        self.authenticated = False
+        if isinstance(error, GarminConnectTooManyRequestsError):
+            message = "Garmin is rate limiting login. Wait before trying again."
+        elif isinstance(error, GarminConnectAuthenticationError):
+            message = "Garmin rejected authentication. Check your credentials or verification code."
+        elif isinstance(error, GarminConnectConnectionError):
+            message = "Cannot reach Garmin sign-in. Garmin may be blocking this network with a security challenge."
+        else:
+            message = "Garmin connection failed. Please try again later."
+        self.error_message = message
+        # Exception bodies may contain account data, URLs, or tokens.
+        logger.warning("Garmin login failed (%s)", type(error).__name__)
+        return False
+
     def authenticate(self) -> bool:
-        """
-        Authenticate with Garmin Connect.
-        Uses cached tokens if available, otherwise performs full login.
-        """
+        """Authenticate without persisting secrets or assuming MFA succeeded."""
         try:
-            # Try loading cached tokens first
-            tokens = self.token_manager.load_tokens()
-            
-            if tokens:
-                # Attempt to restore session with cached tokens
-                try:
-                    self.garmin = Garmin(
-                        email=self.username,
-                        password=self.password,
-                        token=tokens.get('token'),
-                        unit_system='metric'
-                    )
-                    # Verify token is still valid by making a simple request
-                    self.garmin.get_full_sleep_data("today")
-                    logger.info("Authenticated with cached tokens")
-                    return True
-                except Exception as e:
-                    logger.warning(f"Cached tokens invalid, performing full login: {e}")
-            
-            # Perform full login
-            self.garmin.login(self.username, self.password)
-            
-            # Save new tokens
-            tokens = {
-                'token': self.garmin.token if hasattr(self.garmin, 'token') else None,
-                'username': self.username,
-                'last_login': datetime.now().isoformat()
-            }
-            self.token_manager.save_tokens(tokens)
-            logger.info("Authentication successful with new tokens")
+            status, _ = self.garmin.login()
+            self.needs_mfa = status == "needs_mfa"
+            if self.needs_mfa:
+                return False
+            self._finish_login()
             return True
-            
-        except Exception as e:
-            logger.error(f"Authentication failed: {e}")
-            return False
-    
+        except Exception as error:
+            return self._login_error(error)
+
+    def complete_mfa(self, code: str) -> bool:
+        """Complete a pending challenge on the same in-memory SDK session."""
+        if not self.needs_mfa:
+            raise ValueError("No Garmin verification is pending")
+        try:
+            self.garmin.resume_login({}, code)
+            self.garmin.password = None
+            self.authenticated = True
+            self.needs_mfa = False
+            self.error_message = None
+            return True
+        except Exception as error:
+            return self._login_error(error)
+
     def _get_date_range(self, days: int = 28) -> tuple:
         """Get date range for past N days."""
         end_date = datetime.now() - timedelta(days=1)  # Yesterday (most complete data)
@@ -172,17 +170,12 @@ class GarminClient:
         try:
             sleep_data = self.garmin.get_sleep_data(date)
             
-            if not sleep_data or 'sleep' not in sleep_data:
-                logger.warning(f"No sleep data for {date}")
+            if not sleep_data:
                 return None
-            
-            sleep = sleep_data['sleep']
-            if not sleep or len(sleep) == 0:
+            main_sleep = sleep_data.get('dailySleepDTO') or {}
+            if not main_sleep or main_sleep.get('sleepTimeSeconds') is None:
                 return None
-            
-            # Extract main sleep summary
-            main_sleep = sleep[0] if isinstance(sleep, list) else sleep
-            
+
             result = {
                 'date': date,
                 'sleep_duration_hours': self._extract_sleep_duration(main_sleep),
@@ -195,52 +188,29 @@ class GarminClient:
             return result
             
         except Exception as e:
-            logger.error(f"Error fetching sleep data for {date}: {e}")
+            logger.error("Garmin operation failed (%s)", type(e).__name__)
             return None
     
     def _extract_sleep_duration(self, sleep_data: Dict) -> Optional[float]:
-        """Extract sleep duration in hours from sleep data."""
-        try:
-            # Try common field names
-            duration = sleep_data.get('minutes', sleep_data.get('duration', None))
-            if duration:
-                if isinstance(duration, str):
-                    # Parse "HH:MM" format
-                    parts = duration.split(':')
-                    if len(parts) >= 2:
-                        hours = int(parts[0])
-                        minutes = int(parts[1])
-                        return hours + minutes / 60
-                elif isinstance(duration, (int, float)):
-                    # Assume minutes
-                    return duration / 60
-            return None
-        except Exception:
-            return None
-    
+        seconds = sleep_data.get('sleepTimeSeconds')
+        return seconds / 3600 if isinstance(seconds, (int, float)) else None
+
     def _extract_sleep_score(self, sleep_data: Dict) -> Optional[int]:
-        """Extract sleep score from sleep data."""
-        try:
-            return sleep_data.get('score', sleep_data.get('sleepScore', None))
-        except Exception:
-            return None
-    
+        return (sleep_data.get('sleepScores') or {}).get('overall', {}).get('value')
+
     def _extract_sleep_stage(self, sleep_data: Dict, stage: str) -> Optional[int]:
-        """Extract sleep stage duration in minutes."""
-        try:
-            stages = sleep_data.get('stages', {})
-            return stages.get(stage, sleep_data.get(f'{stage}Minutes', None))
-        except Exception:
-            return None
-    
+        seconds = sleep_data.get(f'{stage}SleepSeconds')
+        return seconds / 60 if isinstance(seconds, (int, float)) else None
+
     def fetch_hrv_data(self, date: str) -> Optional[Dict]:
         """
         Fetch HRV data for a specific date.
         Returns HRV status and 7-day baseline.
         """
         try:
-            hrv_data = self.garmin.get_hrv_status(date)
+            hrv_data = self.garmin.get_hrv_data(date)
             
+            hrv_data = (hrv_data or {}).get('hrvSummary') or {}
             if not hrv_data:
                 return None
             
@@ -254,20 +224,20 @@ class GarminClient:
             return result
             
         except Exception as e:
-            logger.error(f"Error fetching HRV data for {date}: {e}")
+            logger.error("Garmin operation failed (%s)", type(e).__name__)
             return None
     
     def _extract_hrv_value(self, hrv_data: Dict) -> Optional[float]:
         """Extract HRV value (RMSSD)."""
         try:
-            return hrv_data.get('rmssd', hrv_data.get('hrv', hrv_data.get('value', None)))
+            return hrv_data.get('lastNightAvg')
         except Exception:
             return None
     
     def _extract_hrv_baseline(self, hrv_data: Dict) -> Optional[float]:
         """Extract 7-day HRV baseline."""
         try:
-            return hrv_data.get('baseline', hrv_data.get('sevenDayAvg', None))
+            return hrv_data.get('weeklyAvg')
         except Exception:
             return None
     
@@ -277,7 +247,7 @@ class GarminClient:
         """
         try:
             # Garmin Connect stores RHR in body battery or health snapshot
-            rhr_data = self.garmin.get_heart_rate(date)
+            rhr_data = self.garmin.get_heart_rates(date)
             
             if not rhr_data:
                 return None
@@ -290,7 +260,7 @@ class GarminClient:
             return result
             
         except Exception as e:
-            logger.error(f"Error fetching RHR data for {date}: {e}")
+            logger.error("Garmin operation failed (%s)", type(e).__name__)
             return None
     
     def _extract_resting_hr(self, hr_data: Dict) -> Optional[int]:
@@ -306,34 +276,37 @@ class GarminClient:
         Returns average stress score and body battery.
         """
         try:
-            stress_data = self.garmin.get_body_battery(date)
+            stress_data = self.garmin.get_stress_data(date)
+            battery_days = self.garmin.get_body_battery(date)
+            battery = battery_days[0] if battery_days else {}
             
             if not stress_data:
                 return None
             
             result = {
                 'date': date,
-                'body_battery': self._extract_body_battery(stress_data),
+                'body_battery': self._extract_body_battery(battery),
                 'stress': self._extract_stress_score(stress_data)
             }
             
             return result
             
         except Exception as e:
-            logger.error(f"Error fetching stress data for {date}: {e}")
+            logger.error("Garmin operation failed (%s)", type(e).__name__)
             return None
     
     def _extract_body_battery(self, data: Dict) -> Optional[int]:
         """Extract body battery value."""
         try:
-            return data.get('bodyBattery', data.get('body_battery', None))
+            values = data.get('bodyBatteryValuesArray') or []
+            return next((row[-1] for row in reversed(values) if len(row) >= 2 and isinstance(row[-1], (int, float)) and row[-1] >= 0), None)
         except Exception:
             return None
     
     def _extract_stress_score(self, data: Dict) -> Optional[int]:
         """Extract average daily stress score."""
         try:
-            return data.get('stress', data.get('stressScore', None))
+            return data.get('avgStressLevel')
         except Exception:
             return None
     
@@ -346,10 +319,7 @@ class GarminClient:
             date_range = self._get_date_range(28)
         
         try:
-            activities = self.garmin.get_activities(
-                date_range[0],
-                date_range[1]
-            )
+            activities = self.garmin.get_activities_by_date(date_range[0], date_range[1])
             
             if not activities:
                 return []
@@ -357,7 +327,7 @@ class GarminClient:
             # Filter by activity type
             filtered = []
             for activity in activities:
-                act_type = activity.get('activityType', '').lower()
+                act_type = self._activity_type(activity)
                 
                 if activity_type == 'trail' and act_type in TRAIL_RUN_TYPES:
                     filtered.append(self._parse_activity(activity))
@@ -370,50 +340,43 @@ class GarminClient:
             return filtered
             
         except Exception as e:
-            logger.error(f"Error fetching activities: {e}")
+            logger.error("Garmin operation failed (%s)", type(e).__name__)
             return []
     
     def _parse_activity(self, activity: Dict) -> Dict:
         """Parse activity data into standard format."""
         return {
             'id': activity.get('activityId', activity.get('id', '')),
-            'type': activity.get('activityType', 'unknown'),
-            'date': activity.get('startTimeLocal', activity.get('date', '')),
+            'type': self._activity_type(activity),
+            'date': activity.get('startTimeLocal', activity.get('date', ''))[:10],
             'distance_km': self._parse_distance(activity.get('distance', 0)),
             'duration_minutes': self._parse_duration(activity.get('duration', 0)),
             'avg_hr': activity.get('averageHeartRate', activity.get('avgHeartRate', None)),
             'elevation_gain': activity.get('elevationGain', activity.get('totalElevationGain', 0))
         }
     
+    @staticmethod
+    def _activity_type(activity: Dict) -> str:
+        value = activity.get('activityType') or ''
+        if isinstance(value, dict):
+            value = value.get('typeKey', '')
+        return value.lower()
+
     def _parse_distance(self, distance: Any) -> float:
-        """Parse distance, converting to km if needed."""
-        try:
-            if isinstance(distance, (int, float)):
-                # Assume meters if > 1000, otherwise km
-                if distance > 1000:
-                    return distance / 1000
-                return distance
-            return float(distance)
-        except Exception:
-            return 0.0
-    
+        # Garmin reports meters, including runs shorter than one kilometer.
+        return float(distance or 0) / 1000
+
     def _parse_duration(self, duration: Any) -> float:
-        """Parse duration, converting to minutes if needed."""
-        try:
-            if isinstance(duration, (int, float)):
-                # Assume seconds if > 3600, otherwise minutes
-                if duration > 3600:
-                    return duration / 60
-                return duration
-            return float(duration)
-        except Exception:
-            return 0.0
-    
+        # Garmin reports seconds, including activities shorter than one hour.
+        return float(duration or 0) / 60
+
     def get_full_28_day_dataset(self) -> Dict[str, Any]:
         """
         Fetch complete dataset for past 28 days including all metrics.
         Returns structured data for analytics processing.
         """
+        if not self.authenticated:
+            raise ConnectionError("Connect to Garmin before refreshing data")
         date_range = self._get_date_range(28)
         
         logger.info(f"Fetching data from {date_range[0]} to {date_range[1]}")
@@ -473,22 +436,24 @@ class GarminClient:
                    f"{len(dataset['activities']['trail'])} trail runs, "
                    f"{len(dataset['activities']['road'])} road runs")
         
+        if not any(dataset[key] for key in ('sleep', 'hrv', 'rhr', 'stress')) and not any(dataset['activities'].values()):
+            raise ConnectionError('No Garmin data was retrieved; check the connection before retrying')
         return dataset
     
     def logout(self):
-        """Logout and clear tokens."""
-        try:
-            self.garmin.logout()
-            logger.info("Logged out successfully")
-        except Exception as e:
-            logger.error(f"Logout error: {e}")
-        finally:
-            self.token_manager.clear_tokens()
+        """Disconnect locally; never revoke or modify the Garmin account."""
+        self.garmin = None
+        self.authenticated = False
+        self.needs_mfa = False
+        if self.session_dir.exists():
+            shutil.rmtree(self.session_dir)
 
 
 def get_client(username: str, password: str) -> GarminClient:
     """Factory function to create and authenticate Garmin client."""
     client = GarminClient(username, password)
-    if not client.authenticate():
-        raise ConnectionError("Failed to authenticate with Garmin Connect")
+    if not client.authenticate() and not client.needs_mfa:
+        message = client.error_message
+        client.logout()
+        raise ConnectionError(message) from None
     return client

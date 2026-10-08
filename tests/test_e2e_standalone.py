@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Minimal standalone test runner for Garmin Readiness App E2E suite.
-Runs without external pytest dependencies (uses stdlib + unittest.mock).
+Runs with unittest; shared fixture builders require the development pytest dependency.
 Maps to Gherkin acceptance criteria.
 """
 
@@ -30,7 +30,7 @@ class GarminE2EAcceptanceTests(unittest.TestCase):
         dataset = build_well_rested_28_day_dataset()
         result = self.calculate_readiness(dataset)
         self.assertGreaterEqual(
-            result.score, 70,
+            result.score, 75,
             f"Expected readiness >=75 for well-rested user, got {result.score}"
         )
         self.assertEqual(

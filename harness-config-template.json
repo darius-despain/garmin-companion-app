@@ -1,0 +1,8 @@
+{
+  "template_version": "2.0",
+  "project": "garmin-companion-app",
+  "session_persistence_dir": "conversations",
+  "audit_output_dir": "harness/reports",
+  "max_age_days": 30,
+  "minimum_sessions": 2
+}

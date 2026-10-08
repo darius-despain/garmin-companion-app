@@ -2,6 +2,7 @@
 # Python 3.11+
 
 # Core dependencies
+garminconnect==0.3.17
 streamlit>=1.28.0
 plotly>=5.18.0
 

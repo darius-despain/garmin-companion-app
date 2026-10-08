@@ -30,27 +30,12 @@ def run_app_with_dataset(dataset_dict):
     if AppTest is None:
         pytest.skip("streamlit.testing.v1.AppTest not available")
 
-    with patch("app.get_client") as mock_client_factory, \
-         patch("app.calculate_readiness_budget") as mock_readiness, \
-         patch("app.analyze_conditioning_trend") as mock_trend, \
-         patch("app.diagnose_gaps") as mock_gaps:
-
-        # Configure mock client to return dataset when get_full_28_day_dataset called
-        mock_client = MagicMock()
-        mock_client.get_full_28_day_dataset.return_value = dataset_dict
-        mock_client.logout = MagicMock()
-        mock_client_factory.return_value = mock_client
-
-        # Mock analytics results based on dataset state
-        from analytics import calculate_readiness_budget, analyze_conditioning_trend, diagnose_gaps
-        # Use real analytics on fixture data for accurate assertions
-        mock_readiness.side_effect = lambda d, t=None: calculate_readiness_budget(d, t)
-        mock_trend.side_effect = lambda d: analyze_conditioning_trend(d)
-        mock_gaps.side_effect = lambda d: diagnose_gaps(d)
-
-        at = AppTest.from_file("app.py", default_timeout=10)
-        at.run()
-        return at
+    from pathlib import Path
+    at = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py", default_timeout=10)
+    at.session_state.dataset = dataset_dict
+    at.run()
+    assert not at.exception
+    return at
 
 
 # ------------------------------------------------------------------
@@ -109,7 +94,7 @@ def test_sleep_deficit_gap_diagnosis(sleep_deprived_dataset):
         f"Expected Sleep Deficit gap, got '{gaps.primary_gap}'"
 
     # Verify UI rendering contains the gap text
-    texts = [str(e) for e in at.markdown] if hasattr(at, "markdown") else []
+    texts = [str(e.value) for e in at.markdown] if hasattr(at, "markdown") else []
     combined_text = " ".join(texts)
     assert "Sleep Deficit" in combined_text or "Sleep Deficit" in str(at), \
         "Expected Sleep Deficit gap to be visible in UI"
@@ -136,7 +121,7 @@ def test_high_stress_parasympathetic_suppression(high_stress_dataset):
            gaps.primary_gap == "Primary Gap: High Parasympathetic Suppression", \
         f"Expected Parasympathetic Suppression gap, got '{gaps.primary_gap}'"
 
-    texts = [str(e) for e in at.markdown] if hasattr(at, "markdown") else []
+    texts = [str(e.value) for e in at.markdown] if hasattr(at, "markdown") else []
     combined_text = " ".join(texts)
     assert "Parasympathetic Suppression" in combined_text, \
         "Expected Parasympathetic Suppression gap visible in UI"
@@ -162,7 +147,7 @@ def test_conditioning_trending_positive(improved_efficiency_dataset):
     assert trend.direction == "Improving", \
         f"Expected Improving trend, got '{trend.direction}'"
 
-    texts = [str(e) for e in at.markdown] if hasattr(at, "markdown") else []
+    texts = [str(e.value) for e in at.markdown] if hasattr(at, "markdown") else []
     combined_text = " ".join(texts)
     assert "Improving" in combined_text, \
         "Expected 'Improving' trend to be rendered in UI"

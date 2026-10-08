@@ -4,6 +4,7 @@ Provides mocked Garmin Connect responses for Gherkin scenarios.
 """
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timedelta
+import pytest
 
 def build_well_rested_28_day_dataset():
     dataset = {"sleep": {}, "hrv": {}, "rhr": {}, "stress": {},
@@ -15,10 +16,30 @@ def build_well_rested_28_day_dataset():
     dataset["sleep"][today] = {"date": today, "sleep_duration_hours": 8.2, "sleep_score": 92}
     for d in dataset["sleep"]:
         dataset["hrv"][d] = {"date": d, "hrv_value": 45 + 2, "hrv_baseline": 45, "hrv_status": "optimal"}
-        dataset["rhr"][d] = {"date": d, "resting_hr": 54 + (hash(d) % 3)}
+        dataset["rhr"][d] = {"date": d, "resting_hr": 54 if d == today else 55}
         dataset["stress"][d] = {"date": d, "stress": 22, "body_battery": 85}
         dataset["body_battery"][d] = {"date": d, "body_battery": 85}
     return dataset
+
+
+@pytest.fixture
+def well_rested_dataset():
+    return build_well_rested_28_day_dataset()
+
+
+@pytest.fixture
+def sleep_deprived_dataset():
+    return build_sleep_deprived_28_day_dataset()
+
+
+@pytest.fixture
+def high_stress_dataset():
+    return build_high_stress_28_day_dataset()
+
+
+@pytest.fixture
+def improved_efficiency_dataset():
+    return build_improved_efficiency_28_day_dataset()
 
 def build_sleep_deprived_28_day_dataset():
     dataset = {"sleep": {}, "hrv": {}, "rhr": {}, "stress": {},

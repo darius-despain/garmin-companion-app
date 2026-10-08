@@ -1,0 +1,4 @@
+interface:
+  display_name: "Harness Development Loop"
+  short_description: "Implement, test, fix, and record development work"
+  default_prompt: "Use $harness-development-loop to complete this software change and verify the result."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Harness Session Evidence"
+  short_description: "Save journals and inspect cross-session evidence"
+  default_prompt: "Use $harness-session-evidence to record this session or inspect the evidence needed to resume it."

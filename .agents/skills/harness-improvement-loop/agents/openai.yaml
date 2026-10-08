@@ -1,0 +1,4 @@
+interface:
+  display_name: "Harness Improvement Loop"
+  short_description: "Improve harness workflows using session evidence"
+  default_prompt: "Use $harness-improvement-loop to review our session evidence and improve the harness."
