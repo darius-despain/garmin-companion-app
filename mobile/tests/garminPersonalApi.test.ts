@@ -231,5 +231,110 @@ describe("CredentialStore", () => {
 
     const mem = new MemoryCredentialStore();
     await expect(mem.setApiKey("   ")).rejects.toThrow();
+
+    // Regression: rejecting isAvailableAsync degrades cleanly to memory fallback
+    const rejectingStore = new ExpoCredentialStore({
+      isAvailableAsync: vi.fn(async () => {
+        throw new Error("Keychain unavailable");
+      }),
+      getItemAsync: vi.fn(async () => null),
+      setItemAsync: vi.fn(async () => {}),
+      deleteItemAsync: vi.fn(async () => {}),
+    });
+    expect(await rejectingStore.hasApiKey()).toBe(false);
+    await rejectingStore.setApiKey("GCDC_FALLBACK_KEY");
+    expect(await rejectingStore.getApiKey()).toBe("GCDC_FALLBACK_KEY");
+  });
+
+  it("ignores negative Body Battery sentinels and charged delta, and handles ISO-Z timestamps", () => {
+    const bb = normalizeBodyBatteryPayload([
+      { date: "2026-11-23", bodyBatteryMostRecentValue: -1, bodyBatteryHighestValue: 85 },
+      { date: "2026-11-22", charged: 45, bodyBatteryValuesArray: [[1700000000000, 82]] },
+      { date: "2026-11-21", bodyBatteryMostRecentValue: -2, charged: 30 },
+    ]);
+    expect(bb.get("2026-11-23")).toEqual({ bodyBattery: 85 });
+    expect(bb.get("2026-11-22")).toEqual({ bodyBattery: 82 });
+    expect(bb.get("2026-11-21")).toEqual({ bodyBattery: null });
+
+    const isoZ = normalizeActivityPayload({
+      activityId: 5001,
+      activityType: { typeKey: "running" },
+      startTimeLocal: "2026-11-20T07:30:00",
+      startTimeGMT: "2026-11-20T15:30:00Z",
+      distance: 5000,
+      duration: 1500,
+    });
+    expect(isoZ?.utcOffsetSeconds).toBe(-28800);
+  });
+
+  it("deduplicates concurrent token exchanges into a single request and continues activity pagination when page has mixed dates", async () => {
+    let tokenCalls = 0;
+    let resolveToken!: (res: Response) => void;
+    const tokenGate = new Promise<Response>((r) => {
+      resolveToken = r;
+    });
+
+    const client = new GarminPersonalApiClient({
+      apiKeyProvider: async () => "GCDC_SINGLE_FLIGHT",
+      sleepMs: async () => {},
+      fetchImpl: async (url) => {
+        const u = String(url);
+        if (u.endsWith("/token")) {
+          tokenCalls += 1;
+          return tokenGate;
+        }
+        if (u.includes("start=0&")) {
+          // Page 0: 1 item before startDate + 49 in-range items (full page of 50)
+          const page0 = [
+            {
+              activityId: 1,
+              activityType: { typeKey: "running" },
+              startTimeLocal: "2026-10-26 23:30:00",
+              distance: 5000,
+              duration: 1500,
+            },
+            ...Array.from({ length: 49 }, (_, i) => ({
+              activityId: i + 2,
+              activityType: { typeKey: "running" },
+              startTimeLocal: "2026-11-05 07:00:00",
+              distance: 5000,
+              duration: 1500,
+            })),
+          ];
+          return new Response(JSON.stringify(page0), { status: 200 });
+        }
+        if (u.includes("start=50&")) {
+          return new Response(
+            JSON.stringify([
+              {
+                activityId: 200,
+                activityType: { typeKey: "running" },
+                startTimeLocal: "2026-11-20 07:00:00",
+                distance: 8000,
+                duration: 2400,
+              },
+            ]),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify([]), { status: 200 });
+      },
+    });
+
+    const parallel = Promise.all([
+      client.fetchSleepRange("2026-11-20", "2026-11-20"),
+      client.fetchHrvRange("2026-11-20", "2026-11-20"),
+      client.fetchStressRange("2026-11-20", "2026-11-20"),
+      client.fetchBodyBatteryRange("2026-11-20", "2026-11-20"),
+      client.fetchDailySummariesRange("2026-11-20", "2026-11-20"),
+      client.fetchActivities("2026-10-27", "2026-11-23"),
+    ]);
+
+    resolveToken(new Response(JSON.stringify({ access_token: "single_tok", expires_in: 3600 }), { status: 200 }));
+    const results = await parallel;
+    expect(tokenCalls).toBe(1);
+    const activities = results[5];
+    expect(activities.some((a) => a.garminId === "200")).toBe(true);
+    expect(activities).toHaveLength(50);
   });
 });

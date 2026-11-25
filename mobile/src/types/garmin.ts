@@ -54,6 +54,7 @@ export interface SyncCoverage {
 export interface SyncMetadata {
   lastSyncAt: string | null;
   lastSuccessfulSyncAt: string | null;
+  lastCompleteSyncEnd?: string | null;
   requestedStart: string | null;
   requestedEnd: string | null;
   coverage: SyncCoverage | null;

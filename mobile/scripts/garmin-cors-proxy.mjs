@@ -30,14 +30,41 @@ const ALLOWED_GET_PREFIXES = [
 const LOCAL_ORIGIN_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
 
 export function isAllowedPath(method, pathname) {
-  if (!pathname || pathname.includes("..") || !pathname.startsWith("/")) {
+  if (!pathname || typeof pathname !== "string" || !pathname.startsWith("/")) {
     return false;
   }
+  if (/[\x00-\x1f\x7f\\]/.test(pathname) || pathname.includes("..") || pathname.includes("//")) {
+    return false;
+  }
+  // Reject encoded path separators or encoded dots so raw upstream forwarding cannot bypass allowlist
+  if (/%2e|%2f|%5c/i.test(pathname)) {
+    return false;
+  }
+
+  let decoded;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return false;
+  }
+
+  if (
+    !decoded.startsWith("/") ||
+    /[\x00-\x1f\x7f\\]/.test(decoded) ||
+    decoded.includes("..") ||
+    decoded.includes("//")
+  ) {
+    return false;
+  }
+
   if (method === "POST") {
-    return pathname === TOKEN_PATH;
+    return pathname === TOKEN_PATH && decoded === TOKEN_PATH;
   }
   if (method === "GET") {
-    return ALLOWED_GET_PREFIXES.some((prefix) => pathname.startsWith(prefix));
+    return (
+      ALLOWED_GET_PREFIXES.some((prefix) => pathname.startsWith(prefix)) &&
+      ALLOWED_GET_PREFIXES.some((prefix) => decoded.startsWith(prefix))
+    );
   }
   return false;
 }

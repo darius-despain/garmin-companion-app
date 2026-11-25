@@ -80,7 +80,7 @@ export function roundPython(value: number, decimals = 0): number {
     rounded = floor;
   } else {
     // Exact binary half: check exact decimal expansion to see if abs > (floor + 0.5) / factor
-    const exactStr = abs.toFixed(decimals + 15);
+    const exactStr = abs.toFixed(Math.min(100, decimals + 25));
     const dotIdx = exactStr.indexOf(".");
     const frac = dotIdx >= 0 ? exactStr.slice(dotIdx + 1) : "";
     const guardDigit = Number(frac[decimals] ?? "0");

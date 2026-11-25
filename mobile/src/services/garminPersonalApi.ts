@@ -198,6 +198,13 @@ export function formatIsoDateUtc(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
+export function formatIsoDateLocal(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
 export function addDaysIso(dateStr: string, deltaDays: number): string {
   const dt = parseIsoDateUtc(dateStr);
   dt.setUTCDate(dt.getUTCDate() + deltaDays);
@@ -217,6 +224,14 @@ function asFiniteNumber(value: unknown): number | null {
 
 function asNullableString(value: unknown): string | null {
   return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+}
+
+function parseGarminTimestampAsUtcMs(ts: string): number {
+  const trimmed = ts.trim().replace(" ", "T");
+  if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(trimmed)) {
+    return Date.parse(trimmed);
+  }
+  return Date.parse(`${trimmed}Z`);
 }
 
 export function classifyActivityCategory(rawTypeKey: string): ActivityCategory {
@@ -264,8 +279,8 @@ export function normalizeActivityPayload(raw: Record<string, unknown>): Activity
 
   let utcOffsetSeconds: number | null = asFiniteNumber(raw.utcOffsetSeconds);
   if (utcOffsetSeconds === null && typeof raw.startTimeLocal === "string" && typeof raw.startTimeGMT === "string") {
-    const localMs = Date.parse(raw.startTimeLocal.replace(" ", "T") + "Z");
-    const gmtMs = Date.parse(raw.startTimeGMT.replace(" ", "T") + "Z");
+    const localMs = parseGarminTimestampAsUtcMs(raw.startTimeLocal);
+    const gmtMs = parseGarminTimestampAsUtcMs(raw.startTimeGMT);
     if (Number.isFinite(localMs) && Number.isFinite(gmtMs)) {
       utcOffsetSeconds = Math.round((localMs - gmtMs) / 1000);
     }
@@ -396,6 +411,16 @@ export function normalizeStressPayload(payload: unknown): Map<string, { stress: 
   return result;
 }
 
+function firstNonNegativeNumber(...values: unknown[]): number | null {
+  for (const val of values) {
+    const n = asFiniteNumber(val);
+    if (n !== null && n >= 0) {
+      return n;
+    }
+  }
+  return null;
+}
+
 export function normalizeBodyBatteryPayload(
   payload: unknown
 ): Map<string, { bodyBattery: number | null }> {
@@ -407,12 +432,12 @@ export function normalizeBodyBatteryPayload(
     const date = asNullableString(row.date ?? row.calendarDate)?.slice(0, 10);
     if (!date) continue;
 
-    let bodyBattery = asFiniteNumber(
-      row.bodyBatteryMostRecentValue ??
-        row.bodyBatteryHighestValue ??
-        row.highestValue ??
-        row.mostRecentValue ??
-        row.charged
+    // Ignore negative unmeasured sentinels (e.g. -1, -2) and delta fields like `charged`.
+    let bodyBattery = firstNonNegativeNumber(
+      row.bodyBatteryMostRecentValue,
+      row.bodyBatteryHighestValue,
+      row.highestValue,
+      row.mostRecentValue
     );
 
     if (bodyBattery === null && Array.isArray(row.bodyBatteryValuesArray)) {
@@ -445,45 +470,89 @@ export function normalizeDailySummariesPayload(
 
     const rhr = asFiniteNumber(row.restingHeartRate);
     const rawStress = asFiniteNumber(row.averageStressLevel);
-    const bb = asFiniteNumber(
-      row.bodyBatteryMostRecentValue ?? row.bodyBatteryHighestValue ?? row.bodyBatteryAtWakeTime
+    const bb = firstNonNegativeNumber(
+      row.bodyBatteryMostRecentValue,
+      row.bodyBatteryHighestValue,
+      row.bodyBatteryAtWakeTime
     );
 
     result.set(date, {
       restingHr: rhr !== null && rhr > 0 ? rhr : null,
       stress: rawStress !== null && rawStress >= 0 ? rawStress : null,
-      bodyBattery: bb !== null && bb >= 0 ? bb : null,
+      bodyBattery: bb,
     });
   }
   return result;
 }
 
+function parseRetryAfterHeaderMs(response: Response): number | null {
+  const header = response.headers?.get?.("retry-after");
+  if (!header) return null;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return seconds * 1000;
+  }
+  const targetMs = Date.parse(header);
+  if (Number.isFinite(targetMs)) {
+    return Math.max(0, targetMs - Date.now());
+  }
+  return null;
+}
+
 export class PersonalApiAuthenticator {
   private cachedToken: BearerToken | null = null;
+  private inFlightExchange: Promise<BearerToken> | null = null;
   private readonly baseUrl: string;
   private readonly fetchImpl: FetchLike;
   private readonly nowMs: () => number;
+  private readonly sleepMs: (ms: number) => Promise<void>;
+  private readonly maxRetries: number;
+  private readonly initialBackoffMs: number;
 
   constructor(private readonly options: GarminPersonalApiOptions) {
     this.baseUrl = (options.baseUrl ?? DEFAULT_GARMIN_API_BASE_URL).replace(/\/+$/, "");
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.nowMs = options.nowMs ?? (() => Date.now());
+    this.sleepMs = options.sleepMs ?? defaultSleep;
+    this.maxRetries = options.maxRetries ?? 3;
+    this.initialBackoffMs = options.initialBackoffMs ?? 250;
   }
 
   clearCachedToken(): void {
     this.cachedToken = null;
   }
 
-  async getBearerToken(forceRefresh = false): Promise<string> {
+  async getBearerToken(forceRefresh = false, failedToken?: string): Promise<string> {
     const now = this.nowMs();
+
+    // If caller failed with an older token, and a newer cached token already exists, reuse it.
     if (
-      !forceRefresh &&
       this.cachedToken &&
-      now < this.cachedToken.expiresAtMs - TOKEN_REFRESH_BUFFER_MS
+      now < this.cachedToken.expiresAtMs - TOKEN_REFRESH_BUFFER_MS &&
+      (!forceRefresh || (failedToken !== undefined && this.cachedToken.token !== failedToken))
     ) {
       return this.cachedToken.token;
     }
 
+    // Single-flight deduplication: concurrent callers share one in-flight token exchange.
+    if (this.inFlightExchange) {
+      const resolved = await this.inFlightExchange;
+      return resolved.token;
+    }
+
+    if (forceRefresh) {
+      this.cachedToken = null;
+    }
+
+    const exchangePromise = this.exchangeTokenWithRetry().finally(() => {
+      this.inFlightExchange = null;
+    });
+    this.inFlightExchange = exchangePromise;
+    const resolved = await exchangePromise;
+    return resolved.token;
+  }
+
+  private async exchangeTokenWithRetry(): Promise<BearerToken> {
     const apiKey = await this.options.apiKeyProvider();
     if (!apiKey || !apiKey.trim()) {
       throw new GarminAuthError(
@@ -492,33 +561,45 @@ export class PersonalApiAuthenticator {
       );
     }
 
-    const response = await this.fetchImpl(`${this.baseUrl}${TOKEN_EXCHANGE_PATH}`, {
-      method: "POST",
-      headers: {
-        Authorization: `ApiKey ${apiKey.trim()}`,
-        Accept: "application/json",
-      },
-    });
+    let attempt = 0;
+    while (true) {
+      const response = await this.fetchImpl(`${this.baseUrl}${TOKEN_EXCHANGE_PATH}`, {
+        method: "POST",
+        headers: {
+          Authorization: `ApiKey ${apiKey.trim()}`,
+          Accept: "application/json",
+        },
+      });
 
-    if (response.status === 401 || response.status === 403) {
-      this.cachedToken = null;
-      throw new GarminAuthError(
-        "Garmin Personal API key is invalid or expired. Generate a new key in Garmin Connect settings and update it in the app.",
-        { status: response.status, requiresKeyReplacement: true }
-      );
+      if (response.status === 401 || response.status === 403) {
+        this.cachedToken = null;
+        throw new GarminAuthError(
+          "Garmin Personal API key is invalid or expired. Generate a new key in Garmin Connect settings and update it in the app.",
+          { status: response.status, requiresKeyReplacement: true }
+        );
+      }
+
+      if ((response.status === 429 || response.status >= 500) && attempt < this.maxRetries) {
+        const retryAfter = parseRetryAfterHeaderMs(response);
+        const backoff = retryAfter ?? this.initialBackoffMs * 2 ** attempt;
+        attempt += 1;
+        await this.sleepMs(backoff);
+        continue;
+      }
+
+      if (!response.ok) {
+        throw new GarminApiError(
+          `Failed to exchange Garmin Personal API key (HTTP ${response.status}).`,
+          response.status,
+          TOKEN_EXCHANGE_PATH
+        );
+      }
+
+      const bodyText = await response.text();
+      const parsed = parseTokenResponse(bodyText, this.nowMs());
+      this.cachedToken = parsed;
+      return parsed;
     }
-
-    if (!response.ok) {
-      throw new GarminApiError(
-        `Failed to exchange Garmin Personal API key (HTTP ${response.status}).`,
-        response.status,
-        TOKEN_EXCHANGE_PATH
-      );
-    }
-
-    const bodyText = await response.text();
-    this.cachedToken = parseTokenResponse(bodyText, now);
-    return this.cachedToken.token;
   }
 }
 
@@ -539,20 +620,6 @@ export class GarminPersonalApiClient {
     this.initialBackoffMs = options.initialBackoffMs ?? 250;
   }
 
-  private parseRetryAfterMs(response: Response): number | null {
-    const header = response.headers?.get?.("retry-after");
-    if (!header) return null;
-    const seconds = Number(header);
-    if (Number.isFinite(seconds) && seconds >= 0) {
-      return seconds * 1000;
-    }
-    const targetMs = Date.parse(header);
-    if (Number.isFinite(targetMs)) {
-      return Math.max(0, targetMs - Date.now());
-    }
-    return null;
-  }
-
   async getJson<T = unknown>(path: string): Promise<T> {
     let token = await this.auth.getBearerToken(false);
     let retriedAuth = false;
@@ -569,8 +636,7 @@ export class GarminPersonalApiClient {
 
       if (response.status === 401 && !retriedAuth) {
         retriedAuth = true;
-        this.auth.clearCachedToken();
-        token = await this.auth.getBearerToken(true);
+        token = await this.auth.getBearerToken(true, token);
         continue;
       }
 
@@ -582,7 +648,7 @@ export class GarminPersonalApiClient {
       }
 
       if ((response.status === 429 || response.status >= 500) && attempt < this.maxRetries) {
-        const retryAfter = this.parseRetryAfterMs(response);
+        const retryAfter = parseRetryAfterHeaderMs(response);
         const backoff = retryAfter ?? this.initialBackoffMs * 2 ** attempt;
         attempt += 1;
         await this.sleepMs(backoff);
@@ -625,15 +691,17 @@ export class GarminPersonalApiClient {
         break;
       }
 
-      let reachedBeforeStart = false;
+      let datedCount = 0;
+      let allItemsBeforeStart = true;
       for (const raw of payload) {
         if (!raw || typeof raw !== "object") continue;
         const normalized = normalizeActivityPayload(raw as Record<string, unknown>);
         if (!normalized) continue;
+        datedCount += 1;
         if (normalized.date < startDate) {
-          reachedBeforeStart = true;
           continue;
         }
+        allItemsBeforeStart = false;
         if (normalized.date > endDate) {
           continue;
         }
@@ -643,7 +711,7 @@ export class GarminPersonalApiClient {
         }
       }
 
-      if (payload.length < limit || reachedBeforeStart) {
+      if (payload.length < limit || (datedCount > 0 && allItemsBeforeStart)) {
         break;
       }
     }

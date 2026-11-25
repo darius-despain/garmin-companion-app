@@ -19,6 +19,10 @@ describe("garmin-cors-proxy", () => {
     expect(isAllowedPath("GET", "/sleep-service/sleep/dailySleepSummariesByDate")).toBe(true);
     expect(isAllowedPath("POST", "/activitylist-service/activities/search/activities")).toBe(false);
     expect(isAllowedPath("GET", "/../etc/passwd")).toBe(false);
+    expect(isAllowedPath("GET", "/activitylist-service/%2e%2e/secret")).toBe(false);
+    expect(isAllowedPath("GET", "/activitylist-service/%2e%2e%2fpersonalapitoken-service/token")).toBe(false);
+    expect(isAllowedPath("GET", "/activitylist-service/..\\secret")).toBe(false);
+    expect(isAllowedPath("GET", "/activitylist-service//double")).toBe(false);
     expect(isAllowedPath("GET", "/unknown-service/data")).toBe(false);
   });
 

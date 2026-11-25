@@ -51,31 +51,35 @@ interface SecureStoreModuleLike {
 
 export class ExpoCredentialStore implements CredentialStore {
   private readonly fallback = new MemoryCredentialStore();
-  private secureStorePromise: Promise<SecureStoreModuleLike | null> | null = null;
+  private cachedSecureStore: SecureStoreModuleLike | null = null;
 
   constructor(private readonly secureStoreOverride?: SecureStoreModuleLike | null) {}
 
   private async getSecureStore(): Promise<SecureStoreModuleLike | null> {
     if (this.secureStoreOverride !== undefined) {
       if (!this.secureStoreOverride) return null;
-      const available = await this.secureStoreOverride.isAvailableAsync();
-      return available ? this.secureStoreOverride : null;
+      try {
+        const available = await this.secureStoreOverride.isAvailableAsync();
+        return available ? this.secureStoreOverride : null;
+      } catch {
+        return null;
+      }
     }
 
-    if (!this.secureStorePromise) {
-      this.secureStorePromise = (async () => {
-        try {
-          const mod = (await import("expo-secure-store")) as unknown as SecureStoreModuleLike;
-          if (typeof mod?.isAvailableAsync === "function" && (await mod.isAvailableAsync())) {
-            return mod;
-          }
-          return null;
-        } catch {
-          return null;
-        }
-      })();
+    if (this.cachedSecureStore) {
+      return this.cachedSecureStore;
     }
-    return this.secureStorePromise;
+
+    try {
+      const mod = (await import("expo-secure-store")) as unknown as SecureStoreModuleLike;
+      if (typeof mod?.isAvailableAsync === "function" && (await mod.isAvailableAsync())) {
+        this.cachedSecureStore = mod;
+        return mod;
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   async getApiKey(): Promise<string | null> {

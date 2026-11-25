@@ -6,18 +6,18 @@
  * without a Garmin Personal API key.
  */
 
-import { addDaysIso, formatIsoDateUtc } from "../services/garminPersonalApi";
+import { addDaysIso, formatIsoDateLocal } from "../services/garminPersonalApi";
 import type { ActivityRecord, AnalyticsDataset, DailyMetricRecord } from "../types/garmin";
 
 export interface SampleDatasetBundle {
-  anchorDate: string; // Last completed day YYYY-MM-DD
+  anchorDate: string; // Last completed local day YYYY-MM-DD
   dailyMetrics: DailyMetricRecord[];
   activities: ActivityRecord[];
   dataset: AnalyticsDataset;
 }
 
 export function buildSampleDataset(anchorDate?: string): SampleDatasetBundle {
-  const end = anchorDate ?? addDaysIso(formatIsoDateUtc(new Date()), -1);
+  const end = anchorDate ?? addDaysIso(formatIsoDateLocal(new Date()), -1);
   const dailyMetrics: DailyMetricRecord[] = [];
   const activities: ActivityRecord[] = [];
 

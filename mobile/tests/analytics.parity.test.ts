@@ -8,6 +8,7 @@ import {
   diagnoseGaps,
   formatConditioningTrend,
   formatGapAnalysis,
+  roundPython,
 } from "../src/analytics/analytics";
 import { buildSampleDataset } from "../src/data/sampleData";
 import { addDaysIso } from "../src/services/garminPersonalApi";
@@ -243,9 +244,10 @@ describe("analytics.ts <-> analytics.py fixture parity", () => {
     expect(res.missing_inputs).toEqual(["hrv", "rhr", "sleep"]);
   });
 
-  it("handles calculateAerobicEfficiency edge cases", () => {
+  it("handles calculateAerobicEfficiency edge cases and tiny IEEE-754 rounding ties", () => {
     expect(calculateAerobicEfficiency({ distance_km: 0, duration_minutes: 30, avg_hr: 150 }, 50)).toBeNull();
     expect(calculateAerobicEfficiency({ distance_km: 10, duration_minutes: 50, avg_hr: 150 }, 50)).toBe(0.05);
     expect(calculateAerobicEfficiency({ distance_km: 10, duration_minutes: 50, avg_hr: 50 }, 55)).toBeNull();
+    expect(roundPython(0.00005, 4)).toBe(0.0001);
   });
 });

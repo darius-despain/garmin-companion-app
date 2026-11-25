@@ -181,6 +181,102 @@ describe("GarminSqliteStore & GarminSyncService", () => {
     expect(checkIns[0].notes).toBe("Legs feel snappy");
   });
 
+  it("does not advance incremental watermark on partial initial sync and serializes concurrent SQLite writes", async () => {
+    const store = new GarminSqliteStore(createNodeSqliteAdapter());
+    await store.init();
+
+    // 1. Concurrent SQLite transactions serialize cleanly without nested BEGIN errors
+    await expect(
+      Promise.all([
+        store.upsertDailyMetrics([
+          {
+            date: "2026-11-23",
+            sleepDurationHours: 7.5,
+            sleepScore: 84,
+            hrvValue: 55,
+            hrvBaseline: 53,
+            hrvStatus: "BALANCED",
+            restingHr: 52,
+            stress: 25,
+            bodyBattery: 80,
+          },
+        ]),
+        store.upsertActivities([
+          {
+            garminId: "concurrent-1",
+            date: "2026-11-23",
+            startTimeLocal: "2026-11-23 07:00:00",
+            utcOffsetSeconds: -28800,
+            activityType: "running",
+            category: "road_run",
+            name: "Concurrent Run",
+            distanceKm: 5,
+            durationMinutes: 25,
+            avgHr: 145,
+            maxHr: 165,
+            elevationGainM: 30,
+          },
+        ]),
+      ])
+    ).resolves.toEqual([1, 1]);
+
+    // 2. Partial initial sync must NOT advance incremental watermark so retry backfills full 28 days
+    let sleepBroken = true;
+    const backfillStore = new GarminSqliteStore(createNodeSqliteAdapter());
+    await backfillStore.init();
+
+    const client = new GarminPersonalApiClient({
+      apiKeyProvider: async () => "GCDC_TEST_KEY",
+      sleepMs: async () => {},
+      maxRetries: 0,
+      fetchImpl: async (url) => {
+        const u = String(url);
+        if (u.endsWith("/token")) {
+          return new Response(JSON.stringify({ access_token: "tok", expires_in: 3600 }), { status: 200 });
+        }
+        if (u.includes("/sleep-service/")) {
+          if (sleepBroken) return new Response("Server Error", { status: 500 });
+          return new Response(
+            JSON.stringify([
+              { calendarDate: "2026-11-10", sleepTimeSeconds: 27000, sleepScores: { overall: { value: 82 } } },
+              { calendarDate: "2026-11-23", sleepTimeSeconds: 28800, sleepScores: { overall: { value: 90 } } },
+            ]),
+            { status: 200 }
+          );
+        }
+        if (u.includes("/v2/dailysummaries")) {
+          return new Response(
+            JSON.stringify([{ calendarDate: "2026-11-23", restingHeartRate: 51 }]),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify([]), { status: 200 });
+      },
+    });
+
+    const sync = new GarminSyncService(client, backfillStore);
+
+    // Initial sync fails on sleep
+    const first = await sync.syncNow({ todayIso: "2026-11-24" });
+    expect(first.partial).toBe(true);
+    expect(first.requestedStart).toBe("2026-10-27");
+    expect(first.metadata.lastCompleteSyncEnd).toBeNull();
+
+    // Retry after sleep recovers MUST still request full 28-day range and backfill 2026-11-10
+    sleepBroken = false;
+    const second = await sync.syncNow({ todayIso: "2026-11-24" });
+    expect(second.partial).toBe(false);
+    expect(second.requestedStart).toBe("2026-10-27");
+    expect(second.metadata.lastCompleteSyncEnd).toBe("2026-11-23");
+
+    const rows = await backfillStore.getDailyMetrics("2026-11-10", "2026-11-23");
+    expect(rows.find((r) => r.date === "2026-11-10")?.sleepDurationHours).toBe(7.5);
+
+    // Third sync (after complete sync) narrows to 3-day overlap
+    const third = await sync.syncNow({ todayIso: "2026-11-24" });
+    expect(third.requestedStart).toBe("2026-11-20");
+  });
+
   it("builds deterministic 28-day sample data with multiple sports", () => {
     const sample = buildSampleDataset("2026-11-23");
     expect(sample.dailyMetrics).toHaveLength(28);

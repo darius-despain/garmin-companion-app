@@ -131,7 +131,24 @@ export async function openExpoSqliteStore(dbName = "garmin_companion.db"): Promi
 }
 
 export class GarminSqliteStore {
+  private writeQueue: Promise<void> = Promise.resolve();
+
   constructor(private readonly db: SqliteDatabaseLike) {}
+
+  private runSerializedTransaction<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.writeQueue.then(async () => {
+      let result!: T;
+      await this.db.withTransactionAsync(async () => {
+        result = await task();
+      });
+      return result;
+    });
+    this.writeQueue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
 
   async init(): Promise<void> {
     await this.db.execAsync(SCHEMA_SQL);
@@ -144,7 +161,7 @@ export class GarminSqliteStore {
   async upsertDailyMetrics(records: DailyMetricRecord[], nowIso = new Date().toISOString()): Promise<number> {
     if (records.length === 0) return 0;
 
-    await this.db.withTransactionAsync(async () => {
+    return this.runSerializedTransaction(async () => {
       for (const rec of records) {
         await this.db.runAsync(
           `INSERT INTO daily_metrics (
@@ -173,15 +190,14 @@ export class GarminSqliteStore {
           nowIso
         );
       }
+      return records.length;
     });
-
-    return records.length;
   }
 
   async upsertActivities(activities: ActivityRecord[], nowIso = new Date().toISOString()): Promise<number> {
     if (activities.length === 0) return 0;
 
-    await this.db.withTransactionAsync(async () => {
+    return this.runSerializedTransaction(async () => {
       for (const act of activities) {
         await this.db.runAsync(
           `INSERT INTO activities (
@@ -217,9 +233,8 @@ export class GarminSqliteStore {
           nowIso
         );
       }
+      return activities.length;
     });
-
-    return activities.length;
   }
 
   async getDailyMetrics(startDate?: string, endDate?: string): Promise<DailyMetricRecord[]> {
